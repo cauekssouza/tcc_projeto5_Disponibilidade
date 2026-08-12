@@ -1,7 +1,5 @@
 <?php
 
-declare(strict_types=1);
-
 namespace Illuminate\Routing\Middleware;
 
 use Closure;
@@ -9,13 +7,10 @@ use Illuminate\Cache\RateLimiter;
 use Illuminate\Cache\RateLimiting\Unlimited;
 use Illuminate\Http\Exceptions\HttpResponseException;
 use Illuminate\Http\Exceptions\ThrottleRequestsException;
-use Illuminate\Http\Request;
 use Illuminate\Routing\Exceptions\MissingRateLimiterException;
-use Illuminate\Support\Collection;
 use Illuminate\Support\InteractsWithTime;
 use RuntimeException;
 use Symfony\Component\HttpFoundation\Response;
-use UnitEnum;
 
 use function Illuminate\Support\enum_value;
 
@@ -23,124 +18,153 @@ class ThrottleRequests
 {
     use InteractsWithTime;
 
+    protected RateLimiter $limiter;
+
     protected static bool $shouldHashKeys = true;
 
-    public function __construct(
-        protected RateLimiter $limiter,
-    ) {
+    public function __construct(RateLimiter $limiter)
+    {
+        $this->limiter = $limiter;
     }
 
-    public static function using(UnitEnum|string $name): string
+    public static function using($name): string
     {
-        return static::class . ':' . enum_value($name);
+        return static::class.':'.enum_value($name);
     }
 
     /**
      * @named-arguments-supported
      */
     public static function with(
-        int $maxAttempts = 60,
-        int $decayMinutes = 1,
-        string $prefix = '',
+        $maxAttempts = 60,
+        $decayMinutes = 1,
+        $prefix = ''
     ): string {
-        return sprintf(
-            '%s:%d,%d,%s',
-            static::class,
-            $maxAttempts,
-            $decayMinutes,
-            $prefix,
-        );
+        return static::class.':'.implode(',', func_get_args());
     }
 
-    /**
-     * @throws ThrottleRequestsException
-     * @throws MissingRateLimiterException
-     */
     public function handle(
-        Request $request,
+        $request,
         Closure $next,
-        int|string $maxAttempts = 60,
-        float|int $decayMinutes = 1,
-        string $prefix = '',
-    ): Response {
-        if (
-            is_string($maxAttempts)
-            && func_num_args() === 3
-            && ($limiter = $this->limiter->limiter($maxAttempts)) !== null
-        ) {
-            return $this->handleRequestUsingNamedLimiter(
+        $maxAttempts = 60,
+        $decayMinutes = 1,
+        $prefix = ''
+    ) {
+        $namedLimiter = $this->resolveNamedLimiter($maxAttempts);
+
+        if ($namedLimiter !== null && func_num_args() === 3) {
+            return $this->handleNamedLimiter(
                 $request,
                 $next,
                 $maxAttempts,
-                $limiter,
+                $namedLimiter
             );
         }
 
-        return $this->handleRequest(
-            $request,
-            $next,
-            [
-                (object) [
-                    'key' => $prefix . $this->resolveRequestSignature($request),
-                    'maxAttempts' => $this->resolveMaxAttempts($request, $maxAttempts),
-                    'decaySeconds' => 60 * $decayMinutes,
-                    'afterCallback' => null,
-                    'responseCallback' => null,
-                ],
-            ],
-        );
+        $limit = (object) [
+            'key' => $prefix.$this->resolveRequestSignature($request),
+            'maxAttempts' => $this->resolveMaxAttempts($request, $maxAttempts),
+            'decaySeconds' => max(1, (int) round(60 * $decayMinutes)),
+            'afterCallback' => null,
+            'responseCallback' => null,
+        ];
+
+        return $this->handleRequest($request, $next, [$limit]);
     }
 
-    /**
-     * @throws ThrottleRequestsException
-     */
-    protected function handleRequestUsingNamedLimiter(
-        Request $request,
-        Closure $next,
-        string $limiterName,
-        Closure $limiter,
-    ): Response {
-        $limiterResponse = $limiter($request);
-
-        if ($limiterResponse instanceof Response) {
-            return $limiterResponse;
+    protected function resolveNamedLimiter($maxAttempts): ?Closure
+    {
+        if (! is_string($maxAttempts)) {
+            return null;
         }
 
-        if ($limiterResponse instanceof Unlimited) {
+        return $this->limiter->limiter($maxAttempts);
+    }
+
+    protected function handleNamedLimiter(
+        $request,
+        Closure $next,
+        string $limiterName,
+        Closure $limiter
+    ) {
+        $result = $limiter($request);
+
+        if ($result instanceof Response) {
+            return $result;
+        }
+
+        if ($result instanceof Unlimited) {
             return $next($request);
         }
 
-        $limits = Collection::wrap($limiterResponse)
-            ->map(
-                fn ($limit): object => (object) [
-                    'key' => static::$shouldHashKeys
-                        ? md5($limiterName . $limit->key)
-                        : $limiterName . ':' . $limit->key,
-                    'maxAttempts' => $limit->maxAttempts,
-                    'decaySeconds' => $limit->decaySeconds,
-                    'afterCallback' => $limit->afterCallback,
-                    'responseCallback' => $limit->responseCallback,
-                ],
-            )
-            ->all();
+        $limits = [];
+
+        foreach ((array) $this->wrapLimiterResponse($result) as $limit) {
+            $limits[] = (object) [
+                'key' => $this->buildNamedLimiterKey(
+                    $limiterName,
+                    $limit->key
+                ),
+                'maxAttempts' => $limit->maxAttempts,
+                'decaySeconds' => $limit->decaySeconds,
+                'afterCallback' => $limit->afterCallback,
+                'responseCallback' => $limit->responseCallback,
+            ];
+        }
 
         return $this->handleRequest($request, $next, $limits);
     }
 
     /**
-     * @param array<int, object> $limits
-     *
-     * @throws ThrottleRequestsException
+     * Normaliza o retorno do named limiter sem precisar criar
+     * uma Collection em toda requisição.
      */
+    protected function wrapLimiterResponse($response): array
+    {
+        return is_array($response)
+            ? $response
+            : [$response];
+    }
+
+    protected function buildNamedLimiterKey(
+        string $limiterName,
+        $key
+    ): string {
+        $value = $limiterName.$key;
+
+        return static::$shouldHashKeys
+            ? md5($value)
+            : $limiterName.':'.$key;
+    }
+
     protected function handleRequest(
-        Request $request,
+        $request,
         Closure $next,
-        array $limits,
+        array $limits
     ): Response {
+        $this->assertWithinLimits($request, $limits);
+
+        $this->registerImmediateHits($limits);
+
+        $response = $next($request);
+
+        $this->registerConditionalHits($limits, $response);
+
+        return $this->addLimitHeaders($response, $limits);
+    }
+
+    /**
+     * Verifica todos os limites antes de executar a aplicação.
+     *
+     * Isso evita executar controller / banco / APIs externas quando
+     * a requisição já deveria ser rejeitada.
+     */
+    protected function assertWithinLimits($request, array $limits): void
+    {
         foreach ($limits as $limit) {
             if (! $this->limiter->tooManyAttempts(
                 $limit->key,
-                $limit->maxAttempts,
+                $limit->maxAttempts
             )) {
                 continue;
             }
@@ -149,138 +173,156 @@ class ThrottleRequests
                 $request,
                 $limit->key,
                 $limit->maxAttempts,
-                $limit->responseCallback,
+                $limit->responseCallback
             );
         }
+    }
 
+    /**
+     * Consome imediatamente limites sem callback condicional.
+     */
+    protected function registerImmediateHits(array $limits): void
+    {
+        foreach ($limits as $limit) {
+            if ($limit->afterCallback !== null) {
+                continue;
+            }
+
+            $this->limiter->hit(
+                $limit->key,
+                $limit->decaySeconds
+            );
+        }
+    }
+
+    /**
+     * Consome limites cuja contabilização depende da resposta.
+     */
+    protected function registerConditionalHits(
+        array $limits,
+        Response $response
+    ): void {
         foreach ($limits as $limit) {
             if ($limit->afterCallback === null) {
+                continue;
+            }
+
+            if (($limit->afterCallback)($response)) {
                 $this->limiter->hit(
                     $limit->key,
-                    $limit->decaySeconds,
+                    $limit->decaySeconds
                 );
             }
         }
+    }
 
-        $response = $next($request);
-
+    protected function addLimitHeaders(
+        Response $response,
+        array $limits
+    ): Response {
         foreach ($limits as $limit) {
-            if (
-                $limit->afterCallback !== null
-                && ($limit->afterCallback)($response)
-            ) {
-                $this->limiter->hit(
-                    $limit->key,
-                    $limit->decaySeconds,
-                );
-            }
-
             $response = $this->addHeaders(
                 $response,
                 $limit->maxAttempts,
                 $this->calculateRemainingAttempts(
                     $limit->key,
-                    $limit->maxAttempts,
-                ),
+                    $limit->maxAttempts
+                )
             );
         }
 
         return $response;
     }
 
-    /**
-     * @throws MissingRateLimiterException
-     */
-    protected function resolveMaxAttempts(
-        Request $request,
-        int|string $maxAttempts,
-    ): int {
+    protected function resolveMaxAttempts($request, $maxAttempts): int
+    {
         $user = $request->user();
 
         if (
-            is_string($maxAttempts)
-            && str_contains($maxAttempts, '|')
+            is_string($maxAttempts) &&
+            str_contains($maxAttempts, '|')
         ) {
-            [$guestAttempts, $authenticatedAttempts] = explode(
+            [$guestLimit, $authenticatedLimit] = explode(
                 '|',
                 $maxAttempts,
-                2,
+                2
             );
 
             $maxAttempts = $user
-                ? $authenticatedAttempts
-                : $guestAttempts;
+                ? $authenticatedLimit
+                : $guestLimit;
         }
 
         if (
-            ! is_numeric($maxAttempts)
-            && $user?->hasAttribute($maxAttempts)
+            ! is_numeric($maxAttempts) &&
+            $user?->hasAttribute($maxAttempts)
         ) {
             $maxAttempts = $user->{$maxAttempts};
         }
 
         if (is_numeric($maxAttempts)) {
-            return (int) $maxAttempts;
+            return max(0, (int) $maxAttempts);
         }
 
-        throw $user === null
-            ? MissingRateLimiterException::forLimiter($maxAttempts)
-            : MissingRateLimiterException::forLimiterAndUser(
-                $maxAttempts,
-                $user::class,
+        if ($user === null) {
+            throw MissingRateLimiterException::forLimiter(
+                $maxAttempts
             );
+        }
+
+        throw MissingRateLimiterException::forLimiterAndUser(
+            $maxAttempts,
+            get_class($user)
+        );
     }
 
-    /**
-     * @throws RuntimeException
-     */
-    protected function resolveRequestSignature(Request $request): string
+    protected function resolveRequestSignature($request): string
     {
-        if (($user = $request->user()) !== null) {
+        $user = $request->user();
+
+        if ($user !== null) {
             return $this->formatIdentifier(
-                (string) $user->getAuthIdentifier(),
+                (string) $user->getAuthIdentifier()
             );
         }
 
-        if (($route = $request->route()) !== null) {
+        $route = $request->route();
+
+        if ($route !== null) {
             return $this->formatIdentifier(
-                $route->getDomain() . '|' . $request->ip(),
+                $route->getDomain().'|'.$request->ip()
             );
         }
 
         throw new RuntimeException(
-            'Unable to generate the request signature. Route unavailable.',
+            'Unable to generate the request signature. Route unavailable.'
         );
     }
 
     protected function buildException(
-        Request $request,
+        $request,
         string $key,
         int $maxAttempts,
-        ?callable $responseCallback = null,
-    ): ThrottleRequestsException|HttpResponseException {
+        $responseCallback = null
+    ) {
         $retryAfter = $this->getTimeUntilNextRetry($key);
 
         $headers = $this->getHeaders(
             $maxAttempts,
-            $this->calculateRemainingAttempts(
-                $key,
-                $maxAttempts,
-                $retryAfter,
-            ),
-            $retryAfter,
+            0,
+            $retryAfter
         );
 
-        if ($responseCallback !== null) {
+        if (is_callable($responseCallback)) {
             return new HttpResponseException(
-                $responseCallback($request, $headers),
+                $responseCallback($request, $headers)
             );
         }
 
         return new ThrottleRequestsException(
             'Too Many Attempts.',
             null,
-            $headers,
+            $headers
         );
     }
 
@@ -293,48 +335,46 @@ class ThrottleRequests
         Response $response,
         int $maxAttempts,
         int $remainingAttempts,
-        ?int $retryAfter = null,
+        ?int $retryAfter = null
     ): Response {
-        $response->headers->add(
-            $this->getHeaders(
-                $maxAttempts,
-                $remainingAttempts,
-                $retryAfter,
-                $response,
-            ),
+        $headers = $this->getHeaders(
+            $maxAttempts,
+            $remainingAttempts,
+            $retryAfter,
+            $response
         );
+
+        if ($headers !== []) {
+            $response->headers->add($headers);
+        }
 
         return $response;
     }
 
-    /**
-     * @return array<string, int>
-     */
     protected function getHeaders(
         int $maxAttempts,
         int $remainingAttempts,
         ?int $retryAfter = null,
-        ?Response $response = null,
+        ?Response $response = null
     ): array {
-        $currentRemaining = $response?->headers->get(
-            'X-RateLimit-Remaining',
-        );
-
         if (
-            $currentRemaining !== null
-            && (int) $currentRemaining <= $remainingAttempts
+            $response !== null &&
+            $response->headers->has('X-RateLimit-Remaining') &&
+            (int) $response->headers->get('X-RateLimit-Remaining')
+                <= $remainingAttempts
         ) {
             return [];
         }
 
         $headers = [
             'X-RateLimit-Limit' => $maxAttempts,
-            'X-RateLimit-Remaining' => $remainingAttempts,
+            'X-RateLimit-Remaining' => max(0, $remainingAttempts),
         ];
 
         if ($retryAfter !== null) {
             $headers['Retry-After'] = $retryAfter;
-            $headers['X-RateLimit-Reset'] = $this->availableAt($retryAfter);
+            $headers['X-RateLimit-Reset'] =
+                $this->availableAt($retryAfter);
         }
 
         return $headers;
@@ -343,11 +383,16 @@ class ThrottleRequests
     protected function calculateRemainingAttempts(
         string $key,
         int $maxAttempts,
-        ?int $retryAfter = null,
+        ?int $retryAfter = null
     ): int {
-        return $retryAfter === null
-            ? $this->limiter->retriesLeft($key, $maxAttempts)
-            : 0;
+        if ($retryAfter !== null) {
+            return 0;
+        }
+
+        return max(
+            0,
+            $this->limiter->retriesLeft($key, $maxAttempts)
+        );
     }
 
     private function formatIdentifier(string $value): string
@@ -358,7 +403,7 @@ class ThrottleRequests
     }
 
     public static function shouldHashKeys(
-        bool $shouldHashKeys = true,
+        bool $shouldHashKeys = true
     ): void {
         static::$shouldHashKeys = $shouldHashKeys;
     }
