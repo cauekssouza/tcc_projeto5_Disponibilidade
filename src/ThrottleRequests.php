@@ -9,6 +9,7 @@ use Illuminate\Http\Exceptions\HttpResponseException;
 use Illuminate\Http\Exceptions\ThrottleRequestsException;
 use Illuminate\Http\Request;
 use Illuminate\Routing\Exceptions\MissingRateLimiterException;
+use Illuminate\Support\Collection;
 use Illuminate\Support\InteractsWithTime;
 use RuntimeException;
 use Symfony\Component\HttpFoundation\Response;
@@ -21,13 +22,21 @@ class ThrottleRequests
     use InteractsWithTime;
 
     /**
-     * Indicates whether rate limiter keys should be hashed.
+     * The rate limiter instance.
+     */
+    protected RateLimiter $limiter;
+
+    /**
+     * Indicates if the rate limiter keys should be hashed.
      */
     protected static bool $shouldHashKeys = true;
 
-    public function __construct(
-        protected RateLimiter $limiter,
-    ) {
+    /**
+     * Create a new request throttler.
+     */
+    public function __construct(RateLimiter $limiter)
+    {
+        $this->limiter = $limiter;
     }
 
     /**
@@ -48,8 +57,6 @@ class ThrottleRequests
         int $decayMinutes = 1,
         string $prefix = '',
     ): string {
-        // func_get_args() is intentionally retained to preserve the
-        // middleware-string behavior when optional arguments are omitted.
         return static::class.':'.implode(',', func_get_args());
     }
 
@@ -63,35 +70,39 @@ class ThrottleRequests
         Request $request,
         Closure $next,
         int|string $maxAttempts = 60,
-        int|float $decayMinutes = 1,
+        int|float|string $decayMinutes = 1,
         string $prefix = '',
     ): Response {
-        if (
-            is_string($maxAttempts)
-            && func_num_args() === 3
-            && ($limiter = $this->limiter->limiter($maxAttempts)) !== null
-        ) {
-            return $this->handleRequestUsingNamedLimiter(
-                $request,
-                $next,
-                $maxAttempts,
-                $limiter,
-            );
+        if (is_string($maxAttempts) && func_num_args() === 3) {
+            $limiter = $this->limiter->limiter($maxAttempts);
+
+            if ($limiter !== null) {
+                return $this->handleRequestUsingNamedLimiter(
+                    $request,
+                    $next,
+                    $maxAttempts,
+                    $limiter,
+                );
+            }
         }
 
-        $limit = (object) [
-            'key' => $prefix.$this->resolveRequestSignature($request),
-            'maxAttempts' => $this->resolveMaxAttempts($request, $maxAttempts),
-            'decaySeconds' => 60 * $decayMinutes,
-            'afterCallback' => null,
-            'responseCallback' => null,
-        ];
-
-        return $this->handleRequest($request, $next, [$limit]);
+        return $this->handleRequest(
+            $request,
+            $next,
+            [
+                (object) [
+                    'key' => $prefix.$this->resolveRequestSignature($request),
+                    'maxAttempts' => $this->resolveMaxAttempts($request, $maxAttempts),
+                    'decaySeconds' => 60 * (float) $decayMinutes,
+                    'afterCallback' => null,
+                    'responseCallback' => null,
+                ],
+            ],
+        );
     }
 
     /**
-     * Handle a request using a named rate limiter.
+     * Handle an incoming request using a named rate limiter.
      *
      * @throws ThrottleRequestsException
      */
@@ -111,29 +122,25 @@ class ThrottleRequests
             return $next($request);
         }
 
-        $rawLimits = is_iterable($limiterResponse)
-            ? $limiterResponse
-            : [$limiterResponse];
-
-        $limits = [];
-
-        foreach ($rawLimits as $limit) {
-            $limits[] = (object) [
-                'key' => $this->formatNamedLimiterKey($limiterName, $limit->key),
+        $limits = Collection::wrap($limiterResponse)
+            ->map(fn ($limit) => (object) [
+                'key' => self::$shouldHashKeys
+                    ? md5($limiterName.$limit->key)
+                    : $limiterName.':'.$limit->key,
                 'maxAttempts' => $limit->maxAttempts,
                 'decaySeconds' => $limit->decaySeconds,
                 'afterCallback' => $limit->afterCallback,
                 'responseCallback' => $limit->responseCallback,
-            ];
-        }
+            ])
+            ->all();
 
         return $this->handleRequest($request, $next, $limits);
     }
 
     /**
-     * Handle an incoming request against the given limits.
+     * Handle the request against the given rate limits.
      *
-     * @param array<int, object> $limits
+     * @param  array<int, object>  $limits
      *
      * @throws ThrottleRequestsException
      */
@@ -142,12 +149,8 @@ class ThrottleRequests
         Closure $next,
         array $limits,
     ): Response {
-        // Validate every limiter before incrementing any of them.
         foreach ($limits as $limit) {
-            if ($this->limiter->tooManyAttempts(
-                $limit->key,
-                $limit->maxAttempts,
-            )) {
+            if ($this->limiter->tooManyAttempts($limit->key, $limit->maxAttempts)) {
                 throw $this->buildException(
                     $request,
                     $limit->key,
@@ -157,13 +160,9 @@ class ThrottleRequests
             }
         }
 
-        // Limits without an "after" callback count the attempt immediately.
         foreach ($limits as $limit) {
             if ($limit->afterCallback === null) {
-                $this->limiter->hit(
-                    $limit->key,
-                    $limit->decaySeconds,
-                );
+                $this->limiter->hit($limit->key, $limit->decaySeconds);
             }
         }
 
@@ -174,19 +173,18 @@ class ThrottleRequests
                 $limit->afterCallback !== null
                 && ($limit->afterCallback)($response)
             ) {
-                $this->limiter->hit(
-                    $limit->key,
-                    $limit->decaySeconds,
-                );
+                $this->limiter->hit($limit->key, $limit->decaySeconds);
             }
 
-            $response = $this->addHeaders(
+            $remainingAttempts = $this->calculateRemainingAttempts(
+                $limit->key,
+                $limit->maxAttempts,
+            );
+
+            $this->addHeaders(
                 $response,
                 $limit->maxAttempts,
-                $this->calculateRemainingAttempts(
-                    $limit->key,
-                    $limit->maxAttempts,
-                ),
+                $remainingAttempts,
             );
         }
 
@@ -205,11 +203,7 @@ class ThrottleRequests
         $user = $request->user();
 
         if (is_string($maxAttempts) && str_contains($maxAttempts, '|')) {
-            [$guestAttempts, $authenticatedAttempts] = explode(
-                '|',
-                $maxAttempts,
-                2,
-            );
+            [$guestAttempts, $authenticatedAttempts] = explode('|', $maxAttempts, 2);
 
             $maxAttempts = $user
                 ? $authenticatedAttempts
@@ -244,13 +238,13 @@ class ThrottleRequests
      */
     protected function resolveRequestSignature(Request $request): string
     {
-        if (($user = $request->user()) !== null) {
+        if ($user = $request->user()) {
             return $this->formatIdentifier(
                 (string) $user->getAuthIdentifier(),
             );
         }
 
-        if (($route = $request->route()) !== null) {
+        if ($route = $request->route()) {
             return $this->formatIdentifier(
                 $route->getDomain().'|'.$request->ip(),
             );
@@ -304,7 +298,7 @@ class ThrottleRequests
     }
 
     /**
-     * Add rate-limit information to the response headers.
+     * Add rate limit information to the response.
      */
     protected function addHeaders(
         Response $response,
@@ -325,7 +319,7 @@ class ThrottleRequests
     }
 
     /**
-     * Get the rate-limit headers.
+     * Get the rate limit headers.
      *
      * @return array<string, int>
      */
@@ -335,9 +329,7 @@ class ThrottleRequests
         ?int $retryAfter = null,
         ?Response $response = null,
     ): array {
-        $currentRemaining = $response?->headers->get(
-            'X-RateLimit-Remaining',
-        );
+        $currentRemaining = $response?->headers->get('X-RateLimit-Remaining');
 
         if (
             $currentRemaining !== null
@@ -373,28 +365,13 @@ class ThrottleRequests
     }
 
     /**
-     * Format a request identifier according to the hashing configuration.
+     * Format an identifier according to the hashing configuration.
      */
     private function formatIdentifier(string $value): string
     {
-        return static::$shouldHashKeys
+        return self::$shouldHashKeys
             ? sha1($value)
             : $value;
-    }
-
-    /**
-     * Format a named limiter key.
-     *
-     * md5() is intentionally preserved here so existing applications don't
-     * suddenly generate different cache keys after upgrading this class.
-     */
-    private function formatNamedLimiterKey(
-        string $limiterName,
-        string $key,
-    ): string {
-        return static::$shouldHashKeys
-            ? md5($limiterName.$key)
-            : $limiterName.':'.$key;
     }
 
     /**
@@ -402,6 +379,6 @@ class ThrottleRequests
      */
     public static function shouldHashKeys(bool $shouldHashKeys = true): void
     {
-        static::$shouldHashKeys = $shouldHashKeys;
+        self::$shouldHashKeys = $shouldHashKeys;
     }
 }
