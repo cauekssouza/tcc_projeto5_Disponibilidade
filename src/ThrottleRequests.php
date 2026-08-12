@@ -2,19 +2,19 @@
 
 namespace Illuminate\Routing\Middleware;
 
-use App\Contracts\AtomicRateLimiter;
-use App\Contracts\RateLimitReservation;
 use Closure;
 use Illuminate\Cache\RateLimiter;
 use Illuminate\Cache\RateLimiting\Unlimited;
+use Illuminate\Contracts\Redis\Factory as Redis;
 use Illuminate\Http\Exceptions\HttpResponseException;
 use Illuminate\Http\Exceptions\ThrottleRequestsException;
+use Illuminate\Redis\Limiters\DurationLimiter;
 use Illuminate\Routing\Exceptions\MissingRateLimiterException;
 use Illuminate\Support\Collection;
 use Illuminate\Support\InteractsWithTime;
 use RuntimeException;
+use Stringable;
 use Symfony\Component\HttpFoundation\Response;
-use Symfony\Component\HttpKernel\Exception\ServiceUnavailableHttpException;
 use Throwable;
 
 use function Illuminate\Support\enum_value;
@@ -24,44 +24,74 @@ class ThrottleRequests
     use InteractsWithTime;
 
     /**
-     * Named limiter registry.
+     * Limiter usado para resolução dos limitadores nomeados.
      */
     protected RateLimiter $limiter;
 
     /**
-     * Atomic admission-control backend.
+     * Redis é obrigatório para garantir aquisição atômica.
      */
-    protected AtomicRateLimiter $atomicLimiter;
+    protected Redis $redis;
 
     /**
-     * Never expose raw user IDs, IPs or route information in cache keys.
+     * Estado obtido atomicamente no Redis.
+     *
+     * Nunca é exposto ao cliente.
+     *
+     * @var array<string, int>
+     */
+    protected array $decaysAt = [];
+
+    /**
+     * @var array<string, int>
+     */
+    protected array $remaining = [];
+
+    /**
+     * Mantém as chaves opacas mesmo em logs/telemetria/cache.
      */
     protected static bool $shouldHashKeys = true;
 
-    public function __construct(
-        RateLimiter $limiter,
-        AtomicRateLimiter $atomicLimiter
-    ) {
+    /**
+     * Limites defensivos contra chaves gigantes controladas pelo cliente.
+     */
+    private const MAX_IDENTIFIER_LENGTH = 256;
+    private const MAX_PREFIX_LENGTH = 128;
+
+    /**
+     * Em falha da infraestrutura do throttle, não executar a aplicação.
+     *
+     * Retry curto para não transformar a falha do Redis em avalanche.
+     */
+    private const FAILURE_RETRY_AFTER = 1;
+
+    public function __construct(RateLimiter $limiter, Redis $redis)
+    {
         $this->limiter = $limiter;
-        $this->atomicLimiter = $atomicLimiter;
+        $this->redis = $redis;
     }
 
-    public static function using($name)
+    /**
+     * Specify the named rate limiter to use for the middleware.
+     */
+    public static function using($name): string
     {
         return static::class.':'.enum_value($name);
     }
 
+    /**
+     * Specify the rate limiter configuration for the middleware.
+     */
     public static function with(
         $maxAttempts = 60,
         $decayMinutes = 1,
         $prefix = ''
-    ) {
+    ): string {
         return static::class.':'.implode(',', func_get_args());
     }
 
     /**
-     * @throws \Illuminate\Http\Exceptions\ThrottleRequestsException
-     * @throws \Illuminate\Routing\Exceptions\MissingRateLimiterException
+     * Handle an incoming request.
      */
     public function handle(
         $request,
@@ -71,24 +101,21 @@ class ThrottleRequests
         $prefix = ''
     ) {
         if (
-            is_string($maxAttempts)
-            && func_num_args() === 3
-            && ! is_null($limiter = $this->limiter->limiter($maxAttempts))
+            is_string($maxAttempts) &&
+            func_num_args() === 3 &&
+            ! is_null($namedLimiter = $this->limiter->limiter($maxAttempts))
         ) {
             return $this->handleRequestUsingNamedLimiter(
                 $request,
                 $next,
                 $maxAttempts,
-                $limiter
+                $namedLimiter
             );
         }
 
-        $maxAttempts = $this->resolveMaxAttempts(
-            $request,
-            $maxAttempts
-        );
-
+        $maxAttempts = $this->resolveMaxAttempts($request, $maxAttempts);
         $decaySeconds = $this->normalizeDecaySeconds($decayMinutes);
+        $prefix = $this->normalizePrefix($prefix);
 
         return $this->handleRequest(
             $request,
@@ -96,71 +123,105 @@ class ThrottleRequests
             [
                 (object) [
                     'key' => $this->formatIdentifier(
-                        'throttle|'.
-                        $prefix.'|'.
-                        $this->resolveRequestSignature($request)
+                        $prefix.'|'.$this->resolveRequestSignature($request)
                     ),
                     'maxAttempts' => $maxAttempts,
                     'decaySeconds' => $decaySeconds,
+
+                    /*
+                     * Segurança de disponibilidade:
+                     *
+                     * a capacidade é SEMPRE reservada antes de $next().
+                     * afterCallback não pode postergar a contabilização.
+                     */
                     'afterCallback' => null,
+
                     'responseCallback' => null,
                 ],
             ]
         );
     }
 
+    /**
+     * Handle a named limiter.
+     */
     protected function handleRequestUsingNamedLimiter(
         $request,
         Closure $next,
         $limiterName,
         Closure $limiter
     ) {
-        $limiterResponse = $limiter($request);
+        try {
+            $limiterResponse = $limiter($request);
+        } catch (Throwable $e) {
+            /*
+             * O resolver do limiter falhou.
+             *
+             * Fail-closed: não deixa a requisição atingir controller,
+             * banco, filas, APIs externas etc.
+             */
+            throw $this->buildInfrastructureFailureException();
+        }
 
         if ($limiterResponse instanceof Response) {
             return $limiterResponse;
         }
 
-        /*
-         * Unlimited is an explicit application configuration.
-         * It is therefore allowed to bypass admission control.
-         */
         if ($limiterResponse instanceof Unlimited) {
+            /*
+             * Unlimited é uma decisão explícita da configuração.
+             */
             return $next($request);
         }
 
         $limits = Collection::wrap($limiterResponse)
             ->map(function ($limit) use ($limiterName) {
                 $maxAttempts = $this->normalizeMaxAttempts(
-                    $limit->maxAttempts
+                    $limit->maxAttempts ?? null
                 );
 
                 $decaySeconds = $this->normalizeDecaySecondsValue(
-                    $limit->decaySeconds
+                    $limit->decaySeconds ?? null
                 );
 
-                /*
-                 * Always namespace and cryptographically hash the key.
-                 *
-                 * Do not use MD5 here. A SHA-256 digest gives a fixed-size
-                 * opaque key and prevents identifiers/IPs from leaking into
-                 * the cache namespace.
-                 */
-                $key = $this->formatIdentifier(
-                    'named|'.
-                    (string) $limiterName.'|'.
-                    (string) $limit->key
+                $rawKey = $this->normalizeIdentifier(
+                    $limiterName,
+                    'limiter'
+                ).'|'.$this->normalizeIdentifier(
+                    $limit->key ?? '',
+                    'limit key'
                 );
 
                 return (object) [
-                    'key' => $key,
+                    /*
+                     * SHA-256 em vez de MD5/SHA-1.
+                     */
+                    'key' => $this->formatIdentifier($rawKey),
+
                     'maxAttempts' => $maxAttempts,
                     'decaySeconds' => $decaySeconds,
-                    'afterCallback' => $limit->afterCallback,
-                    'responseCallback' => $limit->responseCallback,
+
+                    /*
+                     * afterCallback é intencionalmente ignorado nesta
+                     * variante security-first.
+                     *
+                     * Esperar a resposta para consumir a tentativa permite
+                     * que N requisições caras entrem simultaneamente.
+                     */
+                    'afterCallback' => null,
+
+                    'responseCallback' =>
+                        $limit->responseCallback ?? null,
                 ];
             })
             ->all();
+
+        if ($limits === []) {
+            /*
+             * Configuração ambígua/incorreta não deve resultar em bypass.
+             */
+            throw $this->buildInfrastructureFailureException();
+        }
 
         return $this->handleRequest(
             $request,
@@ -170,139 +231,136 @@ class ThrottleRequests
     }
 
     /**
-     * Reserve EVERY applicable limit before entering the application.
+     * Faz a reserva de TODOS os limites antes de executar a aplicação.
      *
-     * There is deliberately no call to tooManyAttempts() followed by hit().
+     * Propriedade fundamental:
+     *
+     *      acquire(key)
+     *
+     * substitui:
+     *
+     *      tooManyAttempts(key)
+     *      hit(key)
+     *
+     * porque a primeira forma é uma única operação atômica no Redis.
      */
     protected function handleRequest(
         $request,
         Closure $next,
         array $limits
     ) {
-        $reservations = [];
-
         /*
-         * ---------------------------------------------------------------
-         * PHASE 1: ADMISSION CONTROL
-         * ---------------------------------------------------------------
+         * PRIMEIRA FASE:
          *
-         * Everything in this phase happens before $next().
+         * nenhuma lógica da aplicação é executada antes que todos os
+         * limitadores tenham sido avaliados/reservados.
          */
-        foreach ($limits as $index => $limit) {
-            try {
-                $reservation = $this->atomicLimiter->acquire(
-                    $limit->key,
-                    $limit->maxAttempts,
-                    $limit->decaySeconds
-                );
-            } catch (Throwable $e) {
-                /*
-                 * FAIL CLOSED.
-                 *
-                 * No cache/Redis/backend exception is propagated to the
-                 * HTTP client and $next() is NEVER executed.
-                 */
-                $this->releaseReservations($limits, $reservations);
+        foreach ($limits as $limit) {
+            $allowed = $this->reserveAttemptAtomically(
+                $limit->key,
+                $limit->maxAttempts,
+                $limit->decaySeconds
+            );
 
-                throw $this->buildLimiterUnavailableException();
-            }
-
-            if (! $reservation->allowed) {
-                /*
-                 * This request must not consume quotas belonging to limits
-                 * that were successfully reserved earlier in this loop.
-                 */
-                $this->releaseReservations($limits, $reservations);
-
+            if (! $allowed) {
                 throw $this->buildException(
                     $request,
-                    $reservation,
+                    $limit->key,
+                    $limit->maxAttempts,
                     $limit->responseCallback
                 );
             }
-
-            $reservations[$index] = $reservation;
         }
 
         /*
-         * ---------------------------------------------------------------
-         * PHASE 2: APPLICATION
-         * ---------------------------------------------------------------
+         * Somente chegamos aqui se a capacidade foi adquirida.
          *
-         * Reaching this statement proves every limiter granted admission.
+         * CPU / controller / DB / filas / integrações ficam protegidos
+         * do excesso detectado pelo limiter.
          */
-        try {
-            $response = $next($request);
-        } catch (Throwable $e) {
-            /*
-             * Do NOT refund reservations when application code throws.
-             *
-             * Otherwise an attacker may intentionally trigger errors to
-             * obtain effectively unlimited expensive requests.
-             */
-            throw $e;
-        }
+        $response = $next($request);
 
         /*
-         * ---------------------------------------------------------------
-         * PHASE 3: CONDITIONAL ACCOUNTING
-         * ---------------------------------------------------------------
+         * Headers não fazem novas consultas ao contador.
          *
-         * For afterCallback limiters we already reserved capacity before
-         * executing the application.
-         *
-         * If the response should NOT count, refund afterwards.
+         * Utilizamos o estado retornado pela MESMA operação atômica que
+         * autorizou a requisição.
          */
-        foreach ($limits as $index => $limit) {
-            if ($limit->afterCallback) {
-                $shouldCount = true;
-
-                try {
-                    $shouldCount = (bool) ($limit->afterCallback)($response);
-                } catch (Throwable $e) {
-                    /*
-                     * Fail closed:
-                     *
-                     * failure of the callback means the reservation remains
-                     * consumed. An attacker cannot bypass throttling by
-                     * causing the callback to fail.
-                     */
-                    $shouldCount = true;
-                }
-
-                if (! $shouldCount) {
-                    try {
-                        $this->atomicLimiter->release($limit->key);
-                    } catch (Throwable $e) {
-                        /*
-                         * Conservative failure:
-                         * leave the attempt charged.
-                         *
-                         * Never expose backend details.
-                         */
-                    }
-                }
-            }
-
-            $reservation = $reservations[$index];
-
+        foreach ($limits as $limit) {
             $response = $this->addHeaders(
                 $response,
-                $reservation->limit,
-                $reservation->remaining
+                $limit->maxAttempts,
+                $this->calculateRemainingAttempts(
+                    $limit->key,
+                    $limit->maxAttempts
+                )
             );
         }
 
         return $response;
     }
 
+    /**
+     * Operação crítica atomicamente consistente.
+     */
+    protected function reserveAttemptAtomically(
+        string $key,
+        int $maxAttempts,
+        int $decaySeconds
+    ): bool {
+        try {
+            $limiter = new DurationLimiter(
+                $this->redis->connection(),
+                $key,
+                $maxAttempts,
+                $decaySeconds
+            );
+
+            /*
+             * acquire() executa a decisão e o incremento em uma única
+             * execução Lua no Redis.
+             */
+            $allowed = $limiter->acquire();
+
+            $this->decaysAt[$key] = max(
+                $this->currentTime(),
+                (int) $limiter->decaysAt
+            );
+
+            $this->remaining[$key] = max(
+                0,
+                (int) $limiter->remaining
+            );
+
+            return $allowed;
+        } catch (Throwable $e) {
+            /*
+             * FAIL-CLOSED.
+             *
+             * Não fazer fallback para:
+             *
+             *   return true;
+             *   $next($request);
+             *
+             * nem para um limiter local por processo.
+             *
+             * Esses fallbacks permitem bypass exatamente quando a camada
+             * de proteção está indisponível.
+             */
+            throw $this->buildInfrastructureFailureException();
+        }
+    }
+
+    /**
+     * Resolve max attempts.
+     */
     protected function resolveMaxAttempts(
         $request,
         $maxAttempts
-    ) {
+    ): int {
         if (
-            is_string($maxAttempts)
-            && str_contains($maxAttempts, '|')
+            is_string($maxAttempts) &&
+            str_contains($maxAttempts, '|')
         ) {
             $parts = explode('|', $maxAttempts, 2);
 
@@ -312,8 +370,8 @@ class ThrottleRequests
         }
 
         if (
-            ! is_numeric($maxAttempts)
-            && $request->user()?->hasAttribute($maxAttempts)
+            ! is_numeric($maxAttempts) &&
+            $request->user()?->hasAttribute($maxAttempts)
         ) {
             $maxAttempts = $request->user()->{$maxAttempts};
         }
@@ -333,196 +391,249 @@ class ThrottleRequests
     }
 
     /**
-     * Resolve a canonical, unambiguous client identity.
+     * Assinatura robusta da requisição.
      *
-     * Raw values are never returned.
+     * Não aceita IP inválido, vazio ou identificadores arbitrariamente
+     * grandes.
      */
-    protected function resolveRequestSignature($request)
+    protected function resolveRequestSignature($request): string
     {
-        if ($user = $request->user()) {
-            $identifier = $user->getAuthIdentifier();
+        $ip = $this->resolveCanonicalIp($request);
 
-            if (
-                ! is_string($identifier)
-                && ! is_int($identifier)
-            ) {
-                throw new RuntimeException(
-                    'Unable to generate request signature.'
-                );
-            }
-
-            $identifier = trim((string) $identifier);
-
-            if ($identifier === '' || strlen($identifier) > 512) {
-                throw new RuntimeException(
-                    'Unable to generate request signature.'
-                );
-            }
-
-            /*
-             * Include the model class to prevent IDs from different
-             * authentication domains colliding.
-             */
-            return $this->formatIdentifier(
-                'authenticated|'.
-                get_class($user).'|'.
-                $identifier
-            );
-        }
-
+        /*
+         * Não utilizamos Host/X-Forwarded-Host diretamente na assinatura.
+         *
+         * O escopo é obtido da definição interna da rota.
+         */
         $route = $request->route();
 
         if (! $route) {
             throw new RuntimeException(
-                'Unable to generate request signature.'
+                'Rate-limit signature unavailable.'
             );
         }
 
-        /*
-         * request->ip() must already reflect Laravel/Symfony trusted-proxy
-         * configuration. Never manually trust X-Forwarded-For here.
-         */
-        $ip = $request->ip();
+        $routeIdentity = $route->getName();
 
-        if (! is_string($ip)) {
-            throw new RuntimeException(
-                'Unable to generate request signature.'
-            );
+        if (! is_string($routeIdentity) || $routeIdentity === '') {
+            $routeIdentity = $request->method().'|'.$route->uri();
         }
 
-        $ip = trim($ip);
+        $routeIdentity = $this->normalizeIdentifier(
+            $routeIdentity,
+            'route'
+        );
 
-        if (
-            filter_var(
-                $ip,
-                FILTER_VALIDATE_IP,
-                FILTER_FLAG_IPV4 | FILTER_FLAG_IPV6
-            ) === false
-        ) {
+        if ($user = $request->user()) {
+            $userId = $this->normalizeIdentifier(
+                $user->getAuthIdentifier(),
+                'authenticated principal'
+            );
+
             /*
-             * Invalid/spoofed/ambiguous client address => fail closed.
+             * Combina principal + IP.
+             *
+             * Isso impede que a representação textual arbitrária de um
+             * identificador ou IP produza buckets diferentes.
              */
-            throw new RuntimeException(
-                'Unable to generate request signature.'
-            );
+            $material =
+                'v2|auth|'.
+                $routeIdentity.'|'.
+                $userId.'|'.
+                $ip;
+        } else {
+            $material =
+                'v2|guest|'.
+                $routeIdentity.'|'.
+                $ip;
         }
 
-        $packedIp = @inet_pton($ip);
-
-        if ($packedIp === false) {
-            throw new RuntimeException(
-                'Unable to generate request signature.'
-            );
-        }
-
-        /*
-         * inet_pton() canonicalizes equivalent textual IPv6
-         * representations before hashing.
-         */
-        $canonicalIp = bin2hex($packedIp);
-
-        $domain = strtolower(
-            trim((string) $route->getDomain())
-        );
-
-        /*
-         * Domain is only a namespace. The security identity is the
-         * canonical address after trusted-proxy resolution.
-         */
-        return $this->formatIdentifier(
-            'anonymous|'.
-            $domain.'|'.
-            $canonicalIp
-        );
+        return $this->formatIdentifier($material);
     }
 
+    /**
+     * Obtém e canonicaliza o endereço IP.
+     */
+    private function resolveCanonicalIp($request): string
+    {
+        /*
+         * getClientIp()/ip() somente deve considerar Forwarded /
+         * X-Forwarded-For quando Trusted Proxies estiver corretamente
+         * configurado.
+         */
+        $ip = $request->getClientIp();
+
+        if (
+            ! is_string($ip) ||
+            filter_var($ip, FILTER_VALIDATE_IP) === false
+        ) {
+            throw new RuntimeException(
+                'Rate-limit identity unavailable.'
+            );
+        }
+
+        $binary = @inet_pton($ip);
+
+        if ($binary === false) {
+            throw new RuntimeException(
+                'Rate-limit identity unavailable.'
+            );
+        }
+
+        /*
+         * inet_pton elimina diferenças textuais equivalentes de IPv6,
+         * como compressões diferentes do mesmo endereço.
+         */
+        return bin2hex($binary);
+    }
+
+    /**
+     * Validação estrita de identificadores.
+     */
+    private function normalizeIdentifier(
+        mixed $value,
+        string $type
+    ): string {
+        if (
+            ! is_string($value) &&
+            ! is_int($value) &&
+            ! $value instanceof Stringable
+        ) {
+            throw new RuntimeException(
+                'Rate-limit identity unavailable.'
+            );
+        }
+
+        $value = trim((string) $value);
+
+        if (
+            $value === '' ||
+            strlen($value) > self::MAX_IDENTIFIER_LENGTH
+        ) {
+            throw new RuntimeException(
+                'Rate-limit identity unavailable.'
+            );
+        }
+
+        /*
+         * Caracteres de controle não são permitidos.
+         */
+        if (preg_match('/[\x00-\x1F\x7F]/', $value)) {
+            throw new RuntimeException(
+                'Rate-limit identity unavailable.'
+            );
+        }
+
+        return $type.':'.$value;
+    }
+
+    /**
+     * Cria resposta 429.
+     */
     protected function buildException(
         $request,
-        RateLimitReservation $reservation,
+        $key,
+        $maxAttempts,
         $responseCallback = null
     ) {
         /*
-         * Clamp values returned by the backend before reflecting them
-         * into HTTP headers.
+         * Nunca devolve Retry-After negativo ou zero.
          */
         $retryAfter = max(
             1,
-            min(
-                $reservation->retryAfter,
-                86400
-            )
+            $this->getTimeUntilNextRetry($key)
         );
 
         $headers = $this->getHeaders(
-            $reservation->limit,
+            $maxAttempts,
             0,
             $retryAfter
         );
 
         if (is_callable($responseCallback)) {
-            $response = $responseCallback(
-                $request,
-                $headers
-            );
-
             /*
-             * Security headers cannot be silently removed by the custom
-             * response.
+             * Callback continua possível para compatibilidade.
+             *
+             * Nenhum detalhe interno do limiter é passado ao callback:
+             * somente request + headers públicos.
              */
-            $response->headers->set(
-                'X-RateLimit-Limit',
-                (string) $reservation->limit
-            );
+            try {
+                $response = $responseCallback(
+                    $request,
+                    $headers
+                );
 
-            $response->headers->set(
-                'X-RateLimit-Remaining',
-                '0'
-            );
-
-            $response->headers->set(
-                'Retry-After',
-                (string) $retryAfter
-            );
-
-            $response->headers->set(
-                'X-RateLimit-Reset',
-                (string) $this->availableAt($retryAfter)
-            );
-
-            return new HttpResponseException($response);
+                if ($response instanceof Response) {
+                    return new HttpResponseException($response);
+                }
+            } catch (Throwable $e) {
+                /*
+                 * Callback customizado não deve transformar o throttle em
+                 * bypass nem vazar a exceção interna.
+                 */
+            }
         }
 
-        /*
-         * Generic public message:
-         * no key, cache driver, host, exception or Redis details.
-         */
         return new ThrottleRequestsException(
-            'Too Many Attempts.',
+            'Too Many Requests.',
             null,
             $headers
         );
     }
 
     /**
-     * Backend failure is different from an actual 429.
+     * Falha da infraestrutura do limiter.
      *
-     * Return 503, still fail-closed, and disclose no infrastructure
-     * information.
+     * Não informa Redis, host, driver, chave, conexão ou exceção.
      */
-    protected function buildLimiterUnavailableException()
+    protected function buildInfrastructureFailureException():
+        HttpResponseException
     {
-        return new ServiceUnavailableHttpException(
-            5,
-            'Service temporarily unavailable.'
+        $retryAfter = self::FAILURE_RETRY_AFTER;
+
+        return new HttpResponseException(
+            new Response(
+                '',
+                Response::HTTP_SERVICE_UNAVAILABLE,
+                [
+                    'Retry-After' => (string) $retryAfter,
+                    'Cache-Control' => 'no-store',
+                ]
+            )
         );
     }
 
+    /**
+     * Tempo restante do bucket obtido da operação atômica.
+     */
+    protected function getTimeUntilNextRetry(
+        string $key
+    ): int {
+        $decaysAt = $this->decaysAt[$key] ?? null;
+
+        if (! is_int($decaysAt)) {
+            /*
+             * Estado inesperado => comportamento conservador.
+             */
+            return self::FAILURE_RETRY_AFTER;
+        }
+
+        return max(
+            1,
+            $decaysAt - $this->currentTime()
+        );
+    }
+
+    /**
+     * Adiciona headers sem substituir um limite mais restritivo já
+     * presente na resposta.
+     */
     protected function addHeaders(
         Response $response,
         $maxAttempts,
         $remainingAttempts,
         $retryAfter = null
-    ) {
+    ): Response {
         $response->headers->add(
             $this->getHeaders(
                 $maxAttempts,
@@ -535,14 +646,16 @@ class ThrottleRequests
         return $response;
     }
 
+    /**
+     * Gera somente metadados públicos.
+     */
     protected function getHeaders(
         $maxAttempts,
         $remainingAttempts,
         $retryAfter = null,
         ?Response $response = null
-    ) {
+    ): array {
         $maxAttempts = max(1, (int) $maxAttempts);
-
         $remainingAttempts = max(
             0,
             min(
@@ -551,98 +664,106 @@ class ThrottleRequests
             )
         );
 
-        /*
-         * If another limiter already supplied a more restrictive
-         * Remaining value, preserve it.
-         */
-        if (
-            $response
-            && $response->headers->has(
-                'X-RateLimit-Remaining'
-            )
-            && (int) $response->headers->get(
-                'X-RateLimit-Remaining'
-            ) <= $remainingAttempts
-        ) {
-            return [];
+        if ($response) {
+            $existingRemaining =
+                $response->headers->get(
+                    'X-RateLimit-Remaining'
+                );
+
+            if (
+                $existingRemaining !== null &&
+                (int) $existingRemaining <= $remainingAttempts
+            ) {
+                return [];
+            }
         }
 
         $headers = [
-            'X-RateLimit-Limit' => $maxAttempts,
-            'X-RateLimit-Remaining' => $remainingAttempts,
+            'X-RateLimit-Limit' =>
+                (string) $maxAttempts,
+
+            'X-RateLimit-Remaining' =>
+                (string) $remainingAttempts,
         ];
 
         if ($retryAfter !== null) {
-            $retryAfter = max(
-                1,
-                min(
-                    86400,
-                    (int) $retryAfter
-                )
-            );
+            $retryAfter = max(1, (int) $retryAfter);
 
-            $headers['Retry-After'] = $retryAfter;
+            $headers['Retry-After'] =
+                (string) $retryAfter;
 
             /*
-             * Public timestamp only. No backend/cache metadata.
+             * Timestamp público de reset; nenhuma informação sobre
+             * backend/cache.
              */
             $headers['X-RateLimit-Reset'] =
-                $this->availableAt($retryAfter);
+                (string) $this->availableAt($retryAfter);
         }
 
         return $headers;
     }
 
     /**
-     * Release reservations acquired before a later limiter rejected.
+     * Saldo vem da mesma aquisição atômica.
+     *
+     * Não fazemos uma leitura separada retriesLeft(), pois outra
+     * requisição poderia alterar o valor imediatamente depois.
      */
-    private function releaseReservations(
-        array $limits,
-        array $reservations
-    ): void {
-        foreach (
-            array_reverse(
-                array_keys($reservations)
-            ) as $index
-        ) {
-            try {
-                $this->atomicLimiter->release(
-                    $limits[$index]->key
-                );
-            } catch (Throwable $e) {
-                /*
-                 * Conservative behavior:
-                 * leaking one quota unit is safer than allowing an
-                 * unaccounted request through.
-                 */
-            }
+    protected function calculateRemainingAttempts(
+        string $key,
+        int $maxAttempts,
+        $retryAfter = null
+    ): int {
+        if ($retryAfter !== null) {
+            return 0;
         }
+
+        return max(
+            0,
+            min(
+                $maxAttempts,
+                $this->remaining[$key] ?? 0
+            )
+        );
     }
 
-    private function normalizeMaxAttempts($value): int
-    {
+    private function normalizeMaxAttempts(
+        mixed $maxAttempts
+    ): int {
         if (
-            ! is_numeric($value)
-            || (int) $value < 1
-            || (int) $value > 1_000_000
+            filter_var(
+                $maxAttempts,
+                FILTER_VALIDATE_INT
+            ) === false
         ) {
             throw new RuntimeException(
-                'Invalid rate limiter configuration.'
+                'Invalid rate-limit configuration.'
             );
         }
 
-        return (int) $value;
+        $maxAttempts = (int) $maxAttempts;
+
+        if ($maxAttempts < 1) {
+            throw new RuntimeException(
+                'Invalid rate-limit configuration.'
+            );
+        }
+
+        return $maxAttempts;
     }
 
+    /**
+     * Entrada em minutos usada pelo middleware tradicional.
+     */
     private function normalizeDecaySeconds(
-        $decayMinutes
+        mixed $decayMinutes
     ): int {
         if (
-            ! is_numeric($decayMinutes)
-            || (float) $decayMinutes <= 0
+            ! is_numeric($decayMinutes) ||
+            ! is_finite((float) $decayMinutes)
         ) {
             throw new RuntimeException(
-                'Invalid rate limiter configuration.'
+                'Invalid rate-limit configuration.'
             );
         }
 
@@ -650,55 +771,79 @@ class ThrottleRequests
             (float) $decayMinutes * 60
         );
 
-        return $this->normalizeDecaySecondsValue(
-            $seconds
-        );
+        if ($seconds < 1) {
+            throw new RuntimeException(
+                'Invalid rate-limit configuration.'
+            );
+        }
+
+        return $seconds;
     }
 
+    /**
+     * Entrada de Limit::decaySeconds.
+     */
     private function normalizeDecaySecondsValue(
-        $seconds
+        mixed $seconds
     ): int {
         if (
-            ! is_numeric($seconds)
-            || (int) $seconds < 1
-            || (int) $seconds > 86400
+            ! is_numeric($seconds) ||
+            ! is_finite((float) $seconds)
         ) {
             throw new RuntimeException(
-                'Invalid rate limiter configuration.'
+                'Invalid rate-limit configuration.'
             );
         }
 
-        return (int) $seconds;
+        $seconds = (int) ceil((float) $seconds);
+
+        if ($seconds < 1) {
+            throw new RuntimeException(
+                'Invalid rate-limit configuration.'
+            );
+        }
+
+        return $seconds;
+    }
+
+    private function normalizePrefix(
+        mixed $prefix
+    ): string {
+        if (! is_string($prefix)) {
+            throw new RuntimeException(
+                'Invalid rate-limit configuration.'
+            );
+        }
+
+        if (strlen($prefix) > self::MAX_PREFIX_LENGTH) {
+            throw new RuntimeException(
+                'Invalid rate-limit configuration.'
+            );
+        }
+
+        return $prefix;
     }
 
     /**
-     * SHA-256 produces fixed-size opaque keys.
-     *
-     * Disabling hashing is intentionally no longer supported for
-     * production safety.
+     * Chave opaca.
      */
-    private function formatIdentifier($value)
-    {
-        return hash(
-            'sha256',
-            (string) $value
-        );
+    private function formatIdentifier(
+        string $value
+    ): string {
+        /*
+         * Mesmo quando shouldHashKeys(false) for usado, entradas já
+         * passaram por validação/normalização.
+         *
+         * Para produção security-first, mantenha hashing habilitado.
+         */
+        return self::$shouldHashKeys
+            ? hash('sha256', $value)
+            : $value;
     }
 
-    /**
-     * Kept only for backwards API compatibility.
-     *
-     * Raw identifiers are no longer permitted.
-     */
     public static function shouldHashKeys(
         bool $shouldHashKeys = true
-    ) {
-        if (! $shouldHashKeys) {
-            throw new RuntimeException(
-                'Disabling rate limiter key hashing is not permitted.'
-            );
-        }
-
-        self::$shouldHashKeys = true;
+    ): void {
+        self::$shouldHashKeys = $shouldHashKeys;
     }
 }
